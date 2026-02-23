@@ -52,6 +52,7 @@ WORKDIR /app
 COPY celery_app.py /app/
 COPY tasks.py /app/
 COPY utils/ /app/utils/
+COPY stripe_webhook.py /app/
 
 # Create required directories
 RUN mkdir -p /app/temp /app/logs && chown -R unredact:unredact /app

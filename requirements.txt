@@ -10,6 +10,11 @@ psutil==6.1.1
 python-magic==0.4.27
 prometheus-client==0.21.1
 
+# Payment & Webhooks
+stripe==11.3.0
+flask==3.1.0
+gunicorn==23.0.0
+
 # PDF Processing
 pymupdf==1.24.12
 pypdf==5.1.0

@@ -1,5 +1,5 @@
 # UnredactServiceOp - Docker Compose Configuration
-# Production-ready setup with web, worker, redis, and beat services
+# Production-ready setup with web, worker, redis, beat, and webhook services
 
 services:
   # Redis Cache & Message Broker
@@ -89,6 +89,13 @@ services:
       - MAX_CONTENT_SIZE=52428800  # 50MB
       - RATE_LIMIT_FILES=20
       - RATE_LIMIT_WINDOW=300  # 5 minutes
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY:-}
+      - STRIPE_PRICE_ID_MONTHLY=${STRIPE_PRICE_ID_MONTHLY:-}
+      - STRIPE_PRICE_ID_ANNUAL=${STRIPE_PRICE_ID_ANNUAL:-}
+      - STRIPE_MODE=${STRIPE_MODE:-test}
+      - FREE_TIER_SCANS_PER_DAY=5
+      - FREE_TIER_WATERMARK_ENABLED=true
     volumes:
       - ./temp:/app/temp
       - ./logs:/app/logs
@@ -107,6 +114,29 @@ services:
         limits:
           memory: 1G
           cpus: '2.0'
+
+  # Stripe Webhook Handler
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: unredact_webhook
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - STRIPE_PRICE_ID_MONTHLY=${STRIPE_PRICE_ID_MONTHLY:-}
+      - STRIPE_PRICE_ID_ANNUAL=${STRIPE_PRICE_ID_ANNUAL:-}
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: gunicorn -w 4 -b 0.0.0.0:5000 stripe_webhook:app
 
 volumes:
   redis_data:
