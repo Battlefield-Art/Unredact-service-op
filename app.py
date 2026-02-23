@@ -22,6 +22,24 @@ import psutil
 from prometheus_client import Counter, Histogram, generate_latest
 import io
 
+# Import monetization utilities
+from utils.monetization import (
+    get_user_identifier,
+    is_pro_user,
+    can_scan,
+    increment_scan_count,
+    get_pricing_plans,
+    get_checkout_url,
+    get_subscription_status,
+    format_expiry_date,
+    check_and_process_upgrade,
+    get_stripe_publishable_key,
+    is_stripe_configured,
+    is_test_mode,
+    FREE_TIER_SCANS_PER_DAY,
+    FREE_TIER_WATERMARK_ENABLED,
+)
+
 # Configure logging
 LOG_DIR = Path(__file__).parent / 'logs'
 LOG_DIR.mkdir(exist_ok=True)
@@ -173,6 +191,75 @@ st.markdown("""
     .stButton > button:hover {
         background: linear-gradient(135deg, #00ffcc 0%, #00d4aa 100%);
     }
+    
+    /* Pro badge */
+    .pro-badge {
+        background: linear-gradient(135deg, #ffd700 0%, #ffaa00 100%);
+        color: #000;
+        padding: 0.25rem 0.75rem;
+        border-radius: 1rem;
+        font-weight: bold;
+        font-size: 0.875rem;
+    }
+    
+    /* Free badge */
+    .free-badge {
+        background: rgba(100, 100, 120, 0.5);
+        color: #aaa;
+        padding: 0.25rem 0.75rem;
+        border-radius: 1rem;
+        font-size: 0.875rem;
+    }
+    
+    /* Pricing card */
+    .pricing-card {
+        background: rgba(26, 26, 46, 0.9);
+        border: 2px solid #2d3436;
+        border-radius: 1rem;
+        padding: 1.5rem;
+        text-align: center;
+        transition: all 0.3s ease;
+    }
+    .pricing-card.popular {
+        border-color: #00d4aa;
+        box-shadow: 0 0 20px rgba(0, 212, 170, 0.3);
+    }
+    .pricing-card:hover {
+        transform: translateY(-5px);
+    }
+    
+    /* Test mode banner */
+    .test-mode-banner {
+        background: linear-gradient(90deg, #ffa502, #ff6348);
+        color: #fff;
+        padding: 0.5rem;
+        text-align: center;
+        border-radius: 0.5rem;
+        font-weight: bold;
+        margin-bottom: 1rem;
+    }
+    
+    /* Upgrade banner */
+    .upgrade-banner {
+        background: linear-gradient(135deg, rgba(0, 212, 170, 0.1) 0%, rgba(0, 168, 204, 0.1) 100%);
+        border: 1px solid #00d4aa;
+        border-radius: 1rem;
+        padding: 1.5rem;
+        text-align: center;
+    }
+    
+    /* Scan counter */
+    .scan-counter {
+        font-size: 0.875rem;
+        color: #aaa;
+    }
+    .scan-counter .remaining {
+        color: #00d4aa;
+        font-weight: bold;
+    }
+    .scan-counter .limit-reached {
+        color: #ff4757;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -291,6 +378,89 @@ def poll_task_status(task_id: str, max_attempts: int = 300) -> Dict[str, Any]:
 
 
 # ==============================================================================
+# PRICING MODAL
+# ==============================================================================
+
+def show_pricing_modal():
+    """Show pricing modal with subscription options."""
+    plans = get_pricing_plans()
+    
+    # Get current URL for return
+    try:
+        current_url = st.context.headers.get('Referer', 'http://localhost:8501')
+    except:
+        current_url = 'http://localhost:8501'
+    
+    # Check if Stripe is configured
+    if not is_stripe_configured():
+        st.error("⚠️ Subscription system is not configured. Please contact the administrator.")
+        return
+    
+    # Test mode warning
+    if is_test_mode():
+        st.info("💳 You are in **test mode**. Use test card: `4242 4242 4242 4242`")
+    
+    # Create pricing columns
+    cols = st.columns(len(plans))
+    
+    for i, plan in enumerate(plans):
+        with cols[i]:
+            # Card class
+            card_class = "pricing-card"
+            if plan.get('popular'):
+                card_class += " popular"
+            
+            # Plan header
+            st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
+            
+            # Plan name
+            if plan.get('popular'):
+                st.markdown("**Most Popular**")
+            st.markdown(f"### {plan['name']}")
+            
+            # Price
+            st.markdown(f"#### {plan['price_display']}")
+            
+            if plan.get('savings'):
+                st.success(f"Save {plan['savings']}%")
+            
+            st.markdown("---")
+            
+            # Features
+            st.markdown("**Features:**")
+            for feature in plan.get('features', []):
+                st.markdown(f"✅ {feature}")
+            
+            # Limitations (for free tier)
+            if plan.get('limitations'):
+                st.markdown("---")
+                st.markdown("**Limitations:**")
+                for limitation in plan.get('limitations', []):
+                    st.markdown(f"❌ {limitation}")
+            
+            st.markdown("---")
+            
+            # CTA button
+            if plan['id'] == 'free':
+                st.success("Current Plan")
+            else:
+                checkout_url = get_checkout_url(plan['id'], current_url)
+                if checkout_url:
+                    st.link_button(
+                        plan.get('cta', 'Upgrade'),
+                        checkout_url,
+                        type="primary"
+                    )
+                else:
+                    st.error("Checkout unavailable")
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+    
+    st.markdown("---")
+    st.caption("🔒 Payments secured by Stripe | Cancel anytime")
+
+
+# ==============================================================================
 # SESSION STATE MANAGEMENT
 # ==============================================================================
 
@@ -347,6 +517,67 @@ def render_sidebar():
         
         st.markdown("---")
         
+        # Subscription Status
+        st.subheader("Subscription")
+        
+        identifier = get_user_identifier()
+        status = get_subscription_status(identifier)
+        
+        # Test mode banner
+        if is_test_mode() and is_stripe_configured():
+            st.markdown('<div class="test-mode-banner">🔧 Test Mode</div>', unsafe_allow_html=True)
+        
+        # Pro/Free badge
+        if status['is_pro']:
+            plan_name = 'Pro Monthly' if status['tier'] == 'pro_monthly' else 'Pro Annual'
+            st.markdown(f'<span class="pro-badge">⭐ {plan_name}</span>', unsafe_allow_html=True)
+            
+            if status.get('expiry'):
+                expiry_display = format_expiry_date(status['expiry'])
+                st.caption(f"Renews: {expiry_display}")
+            
+            if st.button("Manage Subscription", key="manage_sub"):
+                if status.get('customer_id'):
+                    portal_url = get_customer_portal_url(
+                        status['customer_id'],
+                        st.query_params.get('current_url', 'http://localhost:8501')
+                    )
+                    if portal_url:
+                        import webbrowser
+                        webbrowser.open(portal_url)
+                    else:
+                        st.error("Could not open portal")
+                else:
+                    st.warning("Please contact support to manage your subscription")
+        else:
+            st.markdown('<span class="free-badge">Free Tier</span>', unsafe_allow_html=True)
+            
+            # Scan counter for free tier
+            if status['scans_remaining'] >= 0:
+                remaining = status['scans_remaining']
+                limit = status['scans_limit']
+                used = status['scans_used']
+                
+                if remaining > 0:
+                    st.markdown(
+                        f'<div class="scan-counter">Scans today: <span class="remaining">{remaining}/{limit}</span></div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="scan-counter">Scans today: <span class="limit-reached">{used}/{limit} (Limit reached)</span></div>',
+                        unsafe_allow_html=True
+                    )
+                
+                # Upgrade prompt
+                if remaining <= 2:
+                    st.warning("接近 free scan limit!")
+                    
+            if st.button("Upgrade to Pro", key="upgrade_btn"):
+                show_pricing_modal()
+        
+        st.markdown("---")
+        
         # Info
         st.info("""
         **UnredactServiceOp v1.0**
@@ -374,6 +605,27 @@ def render_upload_page():
     client_ip = get_client_ip()
     if not check_rate_limit(client_ip):
         st.error("🚫 Rate limit exceeded. Please try again later.")
+        return
+    
+    # Check subscription and scan limits
+    identifier = get_user_identifier()
+    is_pro = is_pro_user(identifier)
+    
+    # Show upgrade banner if limit reached
+    if not is_pro and not can_scan(identifier):
+        st.markdown("""
+        <div class="upgrade-banner">
+            <h3>🚫 Daily Scan Limit Reached</h3>
+            <p>You've used all your free scans for today. Upgrade to Pro for unlimited scans!</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("Upgrade to Pro - Unlimited Scans", type="primary"):
+                show_pricing_modal()
+        with col2:
+            st.info(f"Free tier: {FREE_TIER_SCANS_PER_DAY} scans/day")
         return
     
     # File uploader
@@ -473,6 +725,19 @@ def render_upload_page():
                                     'risk_score': result.get('risk_score', 0),
                                     'timestamp': time.time()
                                 })
+                                
+                                # Increment scan count for free tier
+                                if not is_pro:
+                                    increment_scan_count(identifier)
+                                    
+                                    # Show remaining scans and upgrade prompt
+                                    remaining = get_scans_remaining(identifier)
+                                    if remaining > 0:
+                                        st.info(f"📊 Free scan used. {remaining} scans remaining today.")
+                                    else:
+                                        st.warning("🚫 You've reached your daily scan limit!")
+                                        with st.expander("Upgrade to Pro for unlimited scans"):
+                                            show_pricing_modal()
                             else:
                                 error = status.get('error', 'Unknown error')
                                 status_container.error(f"❌ Analysis failed: {error}")
@@ -772,6 +1037,9 @@ def render_health_check():
 
 def main():
     """Main application entry point."""
+    
+    # Check for upgrade success
+    check_and_process_upgrade()
     
     # Route based on URL
     query_params = st.query_params
