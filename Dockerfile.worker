@@ -62,8 +62,7 @@ USER unredact
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    C_FORCE_ROOT=true
+    PYTHONDONTWRITEBYTECODE=1
 
 # Use tini for proper signal handling (PID 1)
 ENTRYPOINT ["/usr/bin/tini", "--"]

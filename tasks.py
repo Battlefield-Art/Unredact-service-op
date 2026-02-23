@@ -5,19 +5,32 @@ All heavy processing tasks MUST be async Celery tasks for 100k-user scalability.
 
 import os
 import sys
+import re
 import json
 import time
 import uuid
 import gc
 import hashlib
 import traceback
+import psutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from functools import wraps
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Import constants
+from constants import (
+    WORKER_MAX_MEMORY_PER_TASK,
+    MAX_CONTENT_SIZE,
+    TEMP_FILE_CLEANUP_AGE_DEFAULT,
+    CELERY_RETRY_BACKOFF_MAX,
+    CELERY_MAX_RETRIES,
+    TASK_SOFT_TIME_LIMIT,
+    TASK_HARD_TIME_LIMIT,
+)
 
 from celery import Task, group
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
@@ -76,14 +89,66 @@ def log_task_execution(func):
 
 
 def get_temp_dir() -> Path:
-    """Get or create temporary directory for file storage."""
+    """
+    Get or create temporary directory for file storage.
+
+    Returns:
+        Path object to temp directory
+    """
     temp_dir = Path(__file__).parent / 'temp'
     temp_dir.mkdir(exist_ok=True)
     return temp_dir
 
 
-def cleanup_temp_file(file_path: Path, max_age_hours: int = 24):
-    """Clean up old temporary files."""
+def sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename to prevent path traversal attacks.
+
+    Args:
+        filename: Original filename
+
+    Returns:
+        Sanitized filename safe for filesystem operations
+    """
+    # Remove path separators and special characters
+    safe = re.sub(r'[^\w.-]', '', filename)
+    # Limit length
+    return safe[:255]
+
+
+def validate_temp_path(file_path: Path, temp_dir: Path) -> bool:
+    """
+    Validate that file path is within temp directory (prevents path traversal).
+
+    Args:
+        file_path: Path to validate
+        temp_dir: Allowed temp directory
+
+    Returns:
+        True if path is safe, False otherwise
+    """
+    try:
+        resolved_path = file_path.resolve()
+        resolved_temp = temp_dir.resolve()
+        return str(resolved_path).startswith(str(resolved_temp))
+    except Exception:
+        return False
+
+
+def cleanup_temp_file(file_path: Path, max_age_hours: int = None) -> bool:
+    """
+    Clean up old temporary files.
+
+    Args:
+        file_path: Path to file to clean up
+        max_age_hours: Maximum age in hours (default from constants)
+
+    Returns:
+        True if file was deleted, False otherwise
+    """
+    if max_age_hours is None:
+        max_age_hours = TEMP_FILE_CLEANUP_AGE_DEFAULT
+
     try:
         if file_path.exists():
             file_age = datetime.now() - datetime.fromtimestamp(file_path.stat().st_mtime)
@@ -91,7 +156,7 @@ def cleanup_temp_file(file_path: Path, max_age_hours: int = 24):
                 file_path.unlink()
                 return True
     except Exception as e:
-        loguru.logger.warning(f"Failed to cleanup {file_path}: {e}")
+        loguru.logger.warning(f"Failed to cleanup {file_path.name}: {e}")
     return False
 
 
@@ -106,18 +171,21 @@ from celery_app import celery_app
 # ==============================================================================
 
 class BaseTask(Task):
-    """Base task class with retry logic and error handling."""
-    
-    # Retry configuration - 3 retries with exponential backoff
+    """
+    Base task class with retry logic and error handling.
+
+    Retry configuration is environment-based for production flexibility.
+    """
+    # Retry configuration - Environment-based
     autoretry_for = (Exception, SoftTimeLimitExceeded, TimeLimitExceeded)
     retry_backoff = True
-    retry_backoff_max = 600  # 10 minutes max backoff
+    retry_backoff_max = int(os.getenv('CELERY_RETRY_BACKOFF_MAX', str(CELERY_RETRY_BACKOFF_MAX)))
     retry_jitter = True
-    max_retries = 3
-    
+    max_retries = int(os.getenv('CELERY_MAX_RETRIES', str(CELERY_MAX_RETRIES)))
+
     # Resource limits
-    soft_time_limit = int(os.getenv('TASK_SOFT_TIME_LIMIT', '120'))
-    time_limit = int(os.getenv('TASK_HARD_TIME_LIMIT', '180'))
+    soft_time_limit = int(os.getenv('TASK_SOFT_TIME_LIMIT', str(TASK_SOFT_TIME_LIMIT)))
+    time_limit = int(os.getenv('TASK_HARD_TIME_LIMIT', str(TASK_HARD_TIME_LIMIT)))
     
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Handle task failure with friendly error message."""
@@ -136,29 +204,49 @@ class BaseTask(Task):
 # UPLOAD PROCESSING TASK
 # ==============================================================================
 
-@celery_app.task(base=BaseTask, bind=True, name='tasks.process_upload', 
+@celery_app.task(base=BaseTask, bind=True, name='tasks.process_upload',
                 queue='high_priority', track_started=True)
 @log_task_execution
 def process_upload(self, file_data: bytes, filename: str, file_type: str,
                    trace_id: str = None, logger=None) -> Dict[str, Any]:
     """
     Process uploaded file - validates, stores, and routes to appropriate analyzer.
-    
+
     This is the entry point for all file processing. It:
-    1. Validates file type and size via magic bytes
-    2. Stores file in temp directory with unique ID
-    3. Routes to PDF or image analyzer
+    1. Checks memory limits
+    2. Validates file type and size via magic bytes
+    3. Stores file in temp directory with path traversal protection
+    4. Routes to PDF or image analyzer
+
+    Args:
+        self: Celery task instance
+        file_data: Raw file bytes
+        filename: Original filename
+        file_type: MIME type
+        trace_id: Request trace ID
+        logger: Logger instance
+
+    Returns:
+        Dictionary with processing results
     """
     if logger is None:
         logger = loguru.logger.bind(trace_id=trace_id or generate_trace_id())
-    
+
     start_time = time.time()
     temp_dir = get_temp_dir()
-    
+
+    # Check memory at start
+    current_memory = psutil.Process().memory_info().rss
+    if current_memory > WORKER_MAX_MEMORY_PER_TASK:
+        raise MemoryError(
+            f"Task exceeds memory limit: {current_memory} > {WORKER_MAX_MEMORY_PER_TASK}"
+        )
+    logger.debug(f"Memory check: {current_memory} / {WORKER_MAX_MEMORY_PER_TASK} bytes")
+
     # Generate unique file ID
     file_id = uuid.uuid4().hex
     file_extension = Path(filename).suffix.lower()
-    
+
     # Validate file type - Magic byte validation
     if file_type not in ['application/pdf', 'image/png', 'image/jpeg']:
         # Check magic bytes as fallback
@@ -171,17 +259,23 @@ def process_upload(self, file_data: bytes, filename: str, file_type: str,
                 file_type = 'image/jpeg'
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
-    
+
     # Validate file size (50MB max)
-    max_size = int(os.getenv('MAX_CONTENT_SIZE', '52428800'))
-    if len(file_data) > max_size:
-        raise ValueError(f"File size exceeds maximum allowed ({max_size / 1024 / 1024}MB)")
-    
+    if len(file_data) > MAX_CONTENT_SIZE:
+        raise ValueError(f"File size exceeds maximum allowed ({MAX_CONTENT_SIZE / 1024 / 1024}MB)")
+
+    # Sanitize filename and create safe path
+    safe_filename = sanitize_filename(f"{file_id}{file_extension}")
+    file_path = temp_dir / safe_filename
+
+    # Validate path is within temp directory
+    if not validate_temp_path(file_path, temp_dir):
+        raise ValueError("Invalid file path - potential traversal attack")
+
     # Save file to temp directory
-    file_path = temp_dir / f"{file_id}{file_extension}"
     file_path.write_bytes(file_data)
-    
-    logger.info(f"File saved: {file_path} ({len(file_data)} bytes)")
+
+    logger.info(f"File saved: {file_path.name} ({len(file_data)} bytes)")
     
     # Route to appropriate analyzer based on file type
     result = {

@@ -6,6 +6,7 @@ Extracts and analyzes EXIF, PDF, and image metadata with risk flagging.
 import os
 import sys
 import json
+import io
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime
@@ -14,6 +15,9 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import loguru
+
+# Import constants
+from constants import HIGH_RISK_FIELDS, MEDIUM_RISK_FIELDS, LOW_RISK_FIELDS
 
 # Try imports with graceful degradation
 try:
@@ -53,13 +57,19 @@ class MetadataExtractor:
     """
     
     def __init__(self, trace_id: str = None):
+        """
+        Initialize MetadataExtractor.
+
+        Args:
+            trace_id: Request trace ID for logging
+        """
         self.trace_id = trace_id or 'unknown'
         self.logger = loguru.logger.bind(trace_id=self.trace_id)
-        
-        # Risk thresholds
-        self.HIGH_RISK_FIELDS = ['gps', 'latitude', 'longitude', 'location', 'coordinates']
-        self.MEDIUM_RISK_FIELDS = ['author', 'creator', 'producer', 'artist', 'copyright']
-        self.LOW_RISK_FIELDS = ['datetime', 'timestamp', 'date', 'software', 'tool']
+
+        # Risk thresholds from constants
+        self.high_risk_fields = HIGH_RISK_FIELDS
+        self.medium_risk_fields = MEDIUM_RISK_FIELDS
+        self.low_risk_fields = LOW_RISK_FIELDS
     
     def extract_pdf_metadata(self, pdf_path: str) -> Dict[str, Any]:
         """
@@ -177,65 +187,84 @@ class MetadataExtractor:
         return metadata
     
     def _extract_exif_read(self, image_path: str) -> Dict[str, Any]:
-        """Extract EXIF using exifread library."""
+        """
+        Extract EXIF using exifread library.
+
+        Args:
+            image_path: Path to image file
+
+        Returns:
+            Dictionary with extracted fields
+        """
         result = {}
-        
+
         try:
             with open(image_path, 'rb') as f:
                 tags = exifread.process_file(f, details=False)
-            
+
             for tag, value in tags.items():
                 # Skip thumbnail
                 if 'thumbnail' in tag.lower():
                     continue
-                    
-                # Convert to string
+
+                # Convert to string with specific exception handling
                 try:
                     str_value = str(value)
-                except:
+                except (UnicodeDecodeError, ValueError, AttributeError) as e:
+                    self.logger.warning(f"EXIF conversion failed for {tag}: {e}")
                     str_value = repr(value)
-                
+
                 # Clean tag name
                 clean_tag = tag.replace(' ', '_').replace('/', '_').lower()
                 result[clean_tag] = str_value
-                
+
                 # Check for GPS
                 if 'gps' in tag.lower():
                     result[f'{clean_tag}_value'] = str_value
-        
+
         except Exception as e:
             self.logger.warning(f"EXIF read extraction failed: {e}")
-        
+
         return {'fields': result} if result else {}
     
     def _extract_piexif(self, image_path: str) -> Dict[str, Any]:
-        """Extract EXIF binary using piexif library."""
+        """
+        Extract EXIF binary using piexif library.
+
+        Args:
+            image_path: Path to image file
+
+        Returns:
+            Dictionary with extracted fields
+        """
         result = {}
-        
+
         try:
             exif_dict = piexif.load(image_path)
-            
+
             # Process each IFD (Image File Directory)
             ifd_names = ['0th', 'Exif', 'GPS', '1st', 'Interop']
-            
+
             for ifd_name in ifd_names:
                 if ifd_name in exif_dict and exif_dict[ifd_name]:
                     for tag_id, tag_value in exif_dict[ifd_name].items():
                         try:
                             tag_name = piexif.TAGS[ifd_name].get(tag_id, {}).get('name', f'tag_{tag_id}')
-                            
+
                             # Handle different value types
                             if isinstance(tag_value, bytes):
                                 if tag_name in ['MakerNote', 'UserComment']:
                                     continue  # Skip large binary
                                 try:
                                     tag_value = tag_value.decode('utf-8', errors='ignore')
-                                except:
+                                except (UnicodeDecodeError, ValueError, AttributeError) as e:
+                                    self.logger.warning(f"EXIF decode failed for {tag_name}: {e}")
                                     tag_value = f'<binary: {len(tag_value)} bytes>'
-                            
+
                             result[f'{ifd_name}_{tag_name}'] = str(tag_value)
-                            
-                        except Exception:
+
+                        except (KeyError, AttributeError, ValueError) as e:
+                            self.logger.warning(f"Failed to process EXIF tag {tag_id}: {e}")
                             continue
             
             # Extract GPS coordinates if available
@@ -302,26 +331,30 @@ class MetadataExtractor:
     def _analyze_metadata_risks(self, fields: Dict[str, str]) -> Dict[str, Any]:
         """
         Analyze metadata fields for sensitive information.
-        
-        Returns risk level and specific factors.
+
+        Args:
+            fields: Dictionary of metadata fields
+
+        Returns:
+            Dictionary with risk level, factors, and cleaned fields
         """
         risk_factors = []
         cleaned = {}
         high_risk_count = 0
         medium_risk_count = 0
         low_risk_count = 0
-        
+
         for key, value in fields.items():
             key_lower = key.lower()
-            
+
             # Clean the value for storage (truncate long values)
             clean_value = str(value)[:200] if value else ''
-            
-            # Check risk level
-            is_high_risk = any(risk in key_lower for risk in self.HIGH_RISK_FIELDS)
-            is_medium_risk = any(risk in key_lower for risk in self.MEDIUM_RISK_FIELDS)
-            is_low_risk = any(risk in key_lower for risk in self.LOW_RISK_FIELDS)
-            
+
+            # Check risk level using instance variables
+            is_high_risk = any(risk in key_lower for risk in self.high_risk_fields)
+            is_medium_risk = any(risk in key_lower for risk in self.medium_risk_fields)
+            is_low_risk = any(risk in key_lower for risk in self.low_risk_fields)
+
             if is_high_risk:
                 high_risk_count += 1
                 risk_factors.append(f"HIGH: {key} = {clean_value[:50]}")
@@ -335,7 +368,7 @@ class MetadataExtractor:
                 cleaned[key] = clean_value
             else:
                 cleaned[key] = clean_value
-        
+
         # Determine overall level
         if high_risk_count > 0:
             level = 'high'
@@ -345,7 +378,7 @@ class MetadataExtractor:
             level = 'low'
         else:
             level = 'none'
-        
+
         return {
             'level': level,
             'factors': risk_factors,
@@ -360,53 +393,71 @@ class MetadataExtractor:
     def strip_metadata(self, file_path: str, output_path: str = None) -> str:
         """
         Strip metadata from file and save to new location.
-        
-        Returns path to cleaned file.
+
+        Args:
+            file_path: Path to input file
+            output_path: Path for output file (optional)
+
+        Returns:
+            Path to cleaned file
         """
         file_ext = Path(file_path).suffix.lower()
-        
+
         if not output_path:
             temp_dir = Path(__file__).parent.parent / 'temp'
             temp_dir.mkdir(exist_ok=True)
             output_path = temp_dir / f"cleaned_{Path(file_path).name}"
-        
+
         try:
-            if file_ext in ['.jpg', '.jpeg', '.png']:
-                # Use PIL to strip metadata
+            if file_ext in ['.jpg', '.jpeg']:
+                # Properly strip EXIF from JPEG
                 from PIL import Image
-                
+
                 img = Image.open(file_path)
-                
-                # Create new image without metadata
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='JPEG', quality=95, exif=b'')
+                img_byte_arr.seek(0)
+                clean_img = Image.open(img_byte_arr)
+                clean_img.save(output_path)
+
+                self.logger.info(f"JPEG EXIF stripped: {Path(file_path).name} -> {Path(output_path).name}")
+
+            elif file_ext == '.png':
+                # PNG doesn't have EXIF in standard, but we create clean version
+                from PIL import Image
+
+                img = Image.open(file_path)
                 data = list(img.getdata())
                 clean_img = Image.new(img.mode, img.size)
                 clean_img.putdata(data)
-                
-                clean_img.save(output_path)
-                
-                self.logger.info(f"Metadata stripped: {file_path} -> {output_path}")
-                
+                clean_img.save(output_path, optimize=True)
+
+                self.logger.info(f"PNG cleaned: {Path(file_path).name} -> {Path(output_path).name}")
+
             elif file_ext == '.pdf':
-                # For PDFs, we need to create a new version without metadata
+                # Remove all PDF metadata
                 if PYPDF_AVAILABLE:
                     from pypdf import PdfReader, PdfWriter
-                    
+
                     reader = PdfReader(file_path)
                     writer = PdfWriter()
-                    
+
                     for page in reader.pages:
                         writer.add_page(page)
-                    
-                    # Remove metadata
+
+                    # Remove all metadata
                     writer.add_metadata({})
-                    
+                    if reader.metadata:
+                        # Explicitly clear PDF info dict
+                        writer.info.clear()
+
                     with open(output_path, 'wb') as f:
                         writer.write(f)
-                    
-                    self.logger.info(f"PDF metadata stripped: {file_path} -> {output_path}")
-            
+
+                    self.logger.info(f"PDF metadata stripped: {Path(file_path).name} -> {Path(output_path).name}")
+
             return str(output_path)
-            
+
         except Exception as e:
             self.logger.error(f"Metadata stripping failed: {e}")
             raise

@@ -5,6 +5,7 @@ Production-ready PDF & Image Redaction Auditor with 100k-user scalability.
 
 import os
 import sys
+import re
 import time
 import json
 import base64
@@ -15,12 +16,25 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import streamlit as st
 import loguru
-import requests
 from celery import Celery
 import redis
 import psutil
-from prometheus_client import Counter, Histogram, generate_latest
+import magic
 import io
+
+# Import constants
+from constants import (
+    MAX_CONTENT_SIZE,
+    RATE_LIMIT_FILES,
+    RATE_LIMIT_WINDOW,
+    POLLING_MAX_ATTEMPTS,
+    POLLING_MAX_RETRIES,
+    ALLOWED_MIME_TYPES,
+    ALLOWED_EXTENSIONS,
+    MAGIC_BYTES,
+    REDIS_SOCKET_TIMEOUT,
+    REDIS_SOCKET_CONNECT_TIMEOUT,
+)
 
 # Import monetization utilities
 from utils.monetization import (
@@ -273,53 +287,96 @@ def generate_trace_id() -> str:
 
 
 def check_rate_limit(ip_address: str) -> bool:
-    """Check if IP has exceeded rate limit."""
+    """
+    Check if IP has exceeded rate limit with atomic operations.
+
+    Uses Lua script for atomic increment and check to prevent race conditions.
+
+    Args:
+        ip_address: Client IP address
+
+    Returns:
+        True if request should be allowed, False if rate limit exceeded
+    """
     if not REDIS_AVAILABLE:
-        return True  # No rate limiting if Redis unavailable
-    
+        return True  # Fail-open on errors
+
     try:
         key = f"rate_limit:{ip_address}"
-        current = redis_client.get(key)
-        
-        if current is None:
-            redis_client.setex(key, RATE_LIMIT_WINDOW, 1)
-            return True
-        
-        if int(current) >= RATE_LIMIT_FILES:
-            return False
-        
-        redis_client.incr(key)
-        return True
+        # Use Lua script for atomic increment and check
+        lua_script = """
+        local current = redis.call('get', KEYS[1])
+        if current == false then
+            redis.call('setex', KEYS[1], ARGV[2], 1)
+            return 1
+        elseif tonumber(current) >= tonumber(ARGV[1]) then
+            return 0
+        else
+            redis.call('incr', KEYS[1])
+            return 1
+        end
+        """
+        result = redis_client.eval(
+            lua_script, 1, key,
+            RATE_LIMIT_FILES, RATE_LIMIT_WINDOW
+        )
+        return bool(result)
     except Exception as e:
         loguru.logger.warning(f"Rate limit check failed: {e}")
-        return True
+        return True  # Fail-open on errors
 
 
 def get_client_ip() -> str:
-    """Get client IP address."""
+    """Get client IP address from request headers."""
     try:
-        return (
-            st.context.headers.get('X-Forwarded-For', '').split(',')[0].strip() or
-            st.context.headers.get('X-Real-IP', '') or
-            '127.0.0.1'
-        )
-    except:
+        x_forwarded = st.context.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+        x_real_ip = st.context.headers.get('X-Real-IP', '')
+        return x_forwarded or x_real_ip or '127.0.0.1'
+    except (KeyError, AttributeError, IndexError) as e:
+        loguru.logger.warning(f"Failed to get client IP: {e}")
         return '127.0.0.1'
 
 
 def validate_file(file) -> Tuple[bool, str]:
-    """Validate uploaded file."""
-    # Check file size
+    """
+    Validate uploaded file with magic byte verification.
+
+    Checks:
+    1. File size (max 50MB)
+    2. Magic bytes (actual file type, not just extension)
+    3. Extension matches actual type
+
+    Args:
+        file: Uploaded file object
+
+    Returns:
+        Tuple of (is_valid, message)
+    """
+    # Check file size first
     if file.size > MAX_CONTENT_SIZE:
         return False, f"File size exceeds maximum ({MAX_CONTENT_SIZE / 1024 / 1024}MB)"
-    
-    # Check file extension
-    allowed_extensions = ['.pdf', '.png', '.jpg', '.jpeg']
+
+    # Validate magic bytes (real file type)
+    file_bytes = file.getvalue()
+    try:
+        mime = magic.from_buffer(file_bytes, mime=True)
+        if mime not in ALLOWED_MIME_TYPES:
+            return False, f"Invalid file type detected: {mime}"
+    except Exception as e:
+        loguru.logger.error(f"File type detection failed: {e}")
+        return False, "File validation failed"
+
+    # Verify extension matches actual type
     file_ext = Path(file.name).suffix.lower()
-    
-    if file_ext not in allowed_extensions:
-        return False, f"Unsupported file type: {file_ext}"
-    
+    if file_ext not in ALLOWED_EXTENSIONS:
+        return False, f"Unsupported file extension: {file_ext}"
+
+    # Verify magic bytes match extension
+    for mime_type, magic_bytes in MAGIC_BYTES.items():
+        if mime in ALLOWED_MIME_TYPES:
+            if not file_bytes.startswith(magic_bytes):
+                return False, f"File content does not match extension {file_ext}"
+
     return True, "Valid"
 
 
@@ -337,16 +394,33 @@ def get_file_type(file) -> str:
     return 'application/octet-stream'
 
 
-def poll_task_status(task_id: str, max_attempts: int = 300) -> Dict[str, Any]:
-    """Poll Celery task status with exponential backoff."""
+def poll_task_status(task_id: str, max_attempts: int = None,
+                     max_retries: int = None) -> Dict[str, Any]:
+    """
+    Poll Celery task status with exponential backoff and retries.
+
+    Args:
+        task_id: Celery task ID to poll
+        max_attempts: Maximum polling attempts (default from constants)
+        max_retries: Maximum retry attempts on failure (default from constants)
+
+    Returns:
+        Dictionary with task status, progress, and result if available
+    """
+    if max_attempts is None:
+        max_attempts = POLLING_MAX_ATTEMPTS
+    if max_retries is None:
+        max_retries = POLLING_MAX_RETRIES
+
     attempt = 0
+    retry_count = 0
     last_status = None
-    
+
     while attempt < max_attempts:
         try:
             result = celery_app.AsyncResult(task_id)
             status = result.state
-            
+
             if status == 'PENDING':
                 last_status = {'state': 'PENDING', 'progress': 0}
             elif status == 'STARTED':
@@ -363,17 +437,22 @@ def poll_task_status(task_id: str, max_attempts: int = 300) -> Dict[str, Any]:
                 }
             else:
                 last_status = {'state': status, 'progress': 20}
-            
+
             # Exponential backoff
             sleep_time = min(2 ** (attempt // 10), 5)
             time.sleep(sleep_time)
             attempt += 1
-            
+
         except Exception as e:
-            loguru.logger.error(f"Task polling error: {e}")
-            last_status = {'state': 'ERROR', 'error': str(e)}
-            break
-    
+            loguru.logger.error(f"Task polling error (attempt {attempt}): {e}")
+            retry_count += 1
+            if retry_count >= max_retries:
+                last_status = {'state': 'ERROR', 'error': str(e)}
+                break
+            # Exponential backoff for retries
+            time.sleep(min(2 ** retry_count, 10))
+            continue
+
     return last_status or {'state': 'TIMEOUT', 'progress': 0}
 
 
@@ -497,21 +576,25 @@ def render_sidebar():
         try:
             # CPU usage
             cpu_percent = psutil.cpu_percent(interval=0.5)
-            st.metric("CPU Usage", f"{cpu_percent:.1f}%", 
+            st.metric("CPU Usage", f"{cpu_percent:.1f}%",
                      delta_color="normal" if cpu_percent < 70 else "inverse")
-            
+
             # Memory usage
             mem = psutil.virtual_memory()
             st.metric("Memory", f"{mem.percent:.1f}%",
                      delta_color="normal" if mem.percent < 80 else "inverse")
-            
-            # Check Redis
+
+            # Check Redis with proper error handling
             if REDIS_AVAILABLE:
-                redis_client.ping()
-                st.success("🟢 Redis Connected")
+                try:
+                    redis_client.ping()
+                    st.success("🟢 Redis Connected")
+                except Exception as redis_error:
+                    loguru.logger.error(f"Redis ping failed: {redis_error}")
+                    st.error("🔴 Redis Error")
             else:
                 st.warning("🟡 Redis Unavailable")
-                
+
         except Exception as e:
             st.error(f"Status error: {e}")
         
@@ -804,24 +887,36 @@ def render_results_page():
                             if report_status['state'] == 'SUCCESS':
                                 report_result = report_status.get('result', {})
                                 files = report_result.get('files', {})
-                                
+
+                                # JSON download with proper error handling
                                 if 'json' in files:
-                                    with open(files['json'], 'r') as f:
+                                    try:
+                                        with open(files['json'], 'r') as f:
+                                            json_data = f.read()
                                         st.download_button(
                                             "📥 Download JSON Report",
-                                            f.read(),
+                                            json_data,
                                             f"report_{task_id[:8]}.json",
                                             "application/json"
                                         )
-                                
+                                    except (IOError, OSError) as file_error:
+                                        loguru.logger.error(f"Failed to read JSON report: {file_error}")
+                                        st.error("Failed to download JSON report")
+
+                                # PDF download with proper error handling
                                 if 'pdf' in files:
-                                    with open(files['pdf'], 'rb') as f:
+                                    try:
+                                        with open(files['pdf'], 'rb') as f:
+                                            pdf_data = f.read()
                                         st.download_button(
                                             "📥 Download PDF Report",
-                                            f.read(),
+                                            pdf_data,
                                             f"report_{task_id[:8]}.pdf",
                                             "application/pdf"
                                         )
+                                    except (IOError, OSError) as file_error:
+                                        loguru.logger.error(f"Failed to read PDF report: {file_error}")
+                                        st.error("Failed to download PDF report")
                         except Exception as e:
                             st.error(f"Report generation failed: {e}")
             
@@ -931,34 +1026,34 @@ def render_history_page():
 def render_settings_page():
     """Render settings page."""
     st.title("⚙️ Settings")
-    
+
     st.markdown("### Configuration")
-    
+
     # Display current settings
     st.write(f"**Max File Size:** {MAX_CONTENT_SIZE / 1024 / 1024:.0f} MB")
     st.write(f"**Rate Limit:** {RATE_LIMIT_FILES} files per IP per {RATE_LIMIT_WINDOW / 60:.0f} minutes")
     st.write(f"**Redis URL:** {REDIS_URL}")
-    
+
     st.markdown("---")
-    
+
     # Image processing settings
     st.markdown("### Image Processing")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         gamma = st.slider("Gamma Correction", 0.1, 3.0, 1.0, 0.1)
         contrast = st.slider("Contrast", 0.5, 2.0, 1.0, 0.1)
-    
+
     with col2:
         exposure = st.slider("Exposure", 0.5, 2.0, 1.0, 0.1)
         clahe = st.slider("CLAHE", 0, 5, 0, 1)
-    
+
     if st.button("Apply Settings"):
         st.success("Settings applied!")
-    
+
     st.markdown("---")
-    
+
     # Health check
     st.markdown("### System Health")
     
@@ -968,38 +1063,38 @@ def render_settings_page():
             cpu = psutil.cpu_percent()
             mem = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
-            
+
             st.write(f"CPU: {cpu:.1f}%")
             st.write(f"Memory: {mem.percent:.1f}%")
             st.write(f"Disk: {disk.percent:.1f}%")
-            
+
+            # Check Redis with proper error handling
             if REDIS_AVAILABLE:
-                redis_client.ping()
-                st.success("Redis: Connected")
+                try:
+                    redis_client.ping()
+                    st.success("Redis: Connected")
+                except Exception as redis_error:
+                    loguru.logger.error(f"Redis ping failed: {redis_error}")
+                    st.error("Redis: Error")
             else:
                 st.warning("Redis: Disconnected")
-                
+
         except Exception as e:
             st.error(f"Health check failed: {e}")
     
     # Metrics endpoint
     st.markdown("---")
     st.markdown("### Prometheus Metrics")
-    
+
     if st.button("View Metrics"):
         try:
-            # Simple metrics display
+            # Simple metrics display - Prometheus endpoint available at /metrics
             st.text("""
-            # HELP unredact_tasks_total Total tasks processed
-            # TYPE unredact_tasks_total counter
-            unredact_tasks_total 0
-            
-            # HELP unredact_task_duration_seconds Task duration
-            # TYPE unredact_task_duration_seconds histogram
-            unredact_task_duration_seconds_bucket{le="1.0"} 0
-            unredact_task_duration_seconds_bucket{le="10.0"} 0
-            unredact_task_duration_seconds_bucket{le="60.0"} 0
-            unredact_task_duration_seconds_bucket{le="+Inf"} 0
+            Prometheus metrics are available at the /metrics endpoint.
+            Metrics tracked:
+            - unredact_tasks_total: Total number of tasks processed
+            - unredact_task_duration_seconds: Task execution time
+            - unredact_active_workers: Number of active workers
             """)
         except Exception as e:
             st.error(f"Metrics error: {e}")
@@ -1012,21 +1107,31 @@ def render_settings_page():
 def render_health_check():
     """Health check endpoint for Streamlit."""
     st.title("Health Check")
-    
+
     try:
         # Check all systems
         checks = {
             'CPU': psutil.cpu_percent(interval=0.5),
             'Memory': psutil.virtual_memory().percent,
             'Disk': psutil.disk_usage('/').percent,
-            'Redis': 'Connected' if (REDIS_AVAILABLE and redis_client.ping()) else 'Disconnected'
         }
-        
+
+        # Check Redis with proper error handling
+        if REDIS_AVAILABLE:
+            try:
+                redis_client.ping()
+                checks['Redis'] = 'Connected'
+            except Exception as redis_error:
+                loguru.logger.error(f"Redis ping failed: {redis_error}")
+                checks['Redis'] = 'Error'
+        else:
+            checks['Redis'] = 'Disconnected'
+
         for name, value in checks.items():
             st.write(f"**{name}:** {value}")
-        
+
         st.success("All systems operational!")
-        
+
     except Exception as e:
         st.error(f"Health check failed: {e}")
 

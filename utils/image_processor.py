@@ -16,6 +16,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import loguru
 
+# Import constants
+from constants import (
+    MIN_GAMMA,
+    MAX_GAMMA,
+    MIN_CONTRAST,
+    MAX_CONTRAST,
+    MIN_EXPOSURE,
+    MAX_EXPOSURE,
+    MIN_CLAHE,
+    MAX_CLAHE,
+    BLACK_REGION_MIN_WIDTH,
+    BLACK_REGION_MIN_HEIGHT,
+    BLACK_REGION_MIN_AREA,
+    BLACK_REGION_LARGE_AREA,
+    BLACK_REGION_COLOR_THRESHOLD,
+    SOLID_COLOR_STD_THRESHOLD,
+    SOLID_REGION_MIN_PERIMETER,
+    LSB_VARIANCE_THRESHOLD,
+    JPEG_BLOCK_SIZE,
+    JPEG_BLOCK_VARIANCE_THRESHOLD,
+)
+
 
 @dataclass
 class ImageAnalysisResult:
@@ -98,104 +120,112 @@ class ImageProcessor:
         return result
     
     def _detect_image_issues(self, img: np.ndarray) -> List[Dict]:
-        """Detect potential redaction issues in image."""
+        """
+        Detect potential redaction issues in image.
+
+        Args:
+            img: OpenCV image array
+
+        Returns:
+            List of detected issues
+        """
         issues = []
-        
+
         try:
             # Convert to different color spaces for analysis
-            if len(img.shape) == 3:
+            # Use ndim attribute instead of len() for dimension count
+            if img.ndim == 3:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             else:
                 gray = img
-            
+
             # 1. Detect large black regions (possible fake redactions)
             # Apply threshold to find black regions
-            _, black_thresh = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
-            
+            _, black_thresh = cv2.threshold(gray, BLACK_REGION_COLOR_THRESHOLD, 255, cv2.THRESH_BINARY)
+
             # Find contours of black regions
             contours, _ = cv2.findContours(black_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
+
             for contour in contours:
                 x, y, w, h = cv2.boundingRect(contour)
                 area = cv2.contourArea(contour)
-                
+
                 # Skip small regions
-                if w < 50 or h < 50 or area < 2500:
+                if w < BLACK_REGION_MIN_WIDTH or h < BLACK_REGION_MIN_HEIGHT or area < BLACK_REGION_MIN_AREA:
                     continue
-                
+
                 # Check aspect ratio (redactions usually have specific shapes)
                 aspect_ratio = float(w) / h if h > 0 else 0
-                
+
                 issues.append({
                     'type': 'large_black_region',
                     'bbox': (int(x), int(y), int(x + w), int(y + h)),
                     'size': (int(w), int(h)),
                     'area': int(area),
                     'aspect_ratio': round(aspect_ratio, 2),
-                    'severity': 'high' if area > 10000 else 'medium',
+                    'severity': 'high' if area > BLACK_REGION_LARGE_AREA else 'medium',
                     'description': f'Large black region ({w}x{h}) - verify it\'s intentional'
                 })
-            
+
             # 2. Detect suspicious solid color regions
             # Use edge detection to find uniform regions
             edges = cv2.Canny(gray, 50, 150)
             edge_contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
+
             for contour in edge_contours:
                 perimeter = cv2.arcLength(contour, True)
-                if perimeter < 100:
+                if perimeter < SOLID_REGION_MIN_PERIMETER:
                     continue
-                    
+
                 # Check if it's a rectangle (common redaction shape)
                 approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-                
+
                 if len(approx) == 4:
                     x, y, w, h = cv2.boundingRect(contour)
                     # Check if it's mostly solid
                     roi = gray[y:y+h, x:x+w]
                     if roi.size > 0:
                         std_dev = np.std(roi)
-                        if std_dev < 10:  # Very uniform region
+                        if std_dev < SOLID_COLOR_STD_THRESHOLD:  # Very uniform region
                             issues.append({
                                 'type': 'solid_color_region',
                                 'bbox': (int(x), int(y), int(x + w), int(y + h)),
                                 'severity': 'medium',
                                 'description': f'Uniform region - verify content is not hidden'
                             })
-            
+
             # 3. Detect embedded images (steganography indicators)
             # Check for unusual pixel patterns in LSB
-            if len(img.shape) == 3 and img.dtype == np.uint8:
+            if img.ndim == 3 and img.dtype == np.uint8:
                 # Check least significant bits for patterns
                 blue_channel = img[:, :, 0]
                 lsb_pattern = blue_channel & 1
                 lsb_variance = np.var(lsb_pattern)
-                
+
                 # Unusually uniform LSB might indicate hidden data
-                if abs(lsb_variance - 0.25) < 0.01:
+                if abs(lsb_variance - 0.25) < LSB_VARIANCE_THRESHOLD:
                     issues.append({
                         'type': 'unusual_lsb_pattern',
                         'severity': 'low',
                         'description': 'Unusual pixel patterns detected - low priority'
                     })
-            
+
             # 4. Check for JPEG artifacts (might indicate copied/redacted content)
-            if len(img.shape) == 3:
+            if img.ndim == 3:
                 # Check for blocking artifacts
-                block_size = 8
                 blocks_variance = []
-                
-                for i in range(0, gray.shape[0] - block_size, block_size):
-                    for j in range(0, gray.shape[1] - block_size, block_size):
-                        block = gray[i:i+block_size, j:j+block_size]
+
+                for i in range(0, gray.shape[0] - JPEG_BLOCK_SIZE, JPEG_BLOCK_SIZE):
+                    for j in range(0, gray.shape[1] - JPEG_BLOCK_SIZE, JPEG_BLOCK_SIZE):
+                        block = gray[i:i+JPEG_BLOCK_SIZE, j:j+JPEG_BLOCK_SIZE]
                         if block.size > 0:
                             blocks_variance.append(np.var(block))
-                
+
                 if blocks_variance:
                     # High variance between blocks might indicate JPEG compression
                     # which can hide redaction evidence
                     between_block_variance = np.var(blocks_variance)
-                    if between_block_variance > 50:
+                    if between_block_variance > JPEG_BLOCK_VARIANCE_THRESHOLD:
                         issues.append({
                             'type': 'jpeg_artifacts',
                             'severity': 'low',
@@ -243,50 +273,70 @@ class ImageProcessor:
         return histogram
     
     def _calculate_statistics(self, img: np.ndarray) -> Dict[str, float]:
-        """Calculate image statistics."""
+        """
+        Calculate image statistics with division by zero protection.
+
+        Args:
+            img: OpenCV image array
+
+        Returns:
+            Dictionary with image statistics
+        """
         stats = {}
-        
+
         try:
-            if len(img.shape) == 3:
+            if img.ndim == 3:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             else:
                 gray = img
-            
+
             stats['mean'] = float(np.mean(gray))
             stats['std_dev'] = float(np.std(gray))
             stats['min'] = float(np.min(gray))
             stats['max'] = float(np.max(gray))
             stats['median'] = float(np.median(gray))
-            
-            # Contrast ratio
-            stats['contrast_ratio'] = stats['max'] / (stats['min'] + 1)
-            
+
+            # Contrast ratio - prevent division by zero
+            stats['contrast_ratio'] = stats['max'] / max(stats['min'], 1)
+
             # Dynamic range
             stats['dynamic_range'] = stats['max'] - stats['min']
-        
+
         except Exception as e:
             self.logger.warning(f"Statistics calculation error: {e}")
-        
         return stats
     
-    def apply_adjustments(self, image_path: str, 
+    def apply_adjustments(self, image_path: str,
                          gamma: float = 1.0,
                          contrast: float = 1.0,
                          exposure: float = 1.0,
                          clahe: float = 0) -> Dict[str, Any]:
         """
-        Apply real-time image adjustments.
-        
+        Apply real-time image adjustments with input validation.
+
         Args:
             image_path: Path to input image
             gamma: Gamma correction (0.1 - 3.0, default 1.0)
             contrast: Contrast adjustment (0.5 - 2.0, default 1.0)
             exposure: Exposure adjustment (0.5 - 2.0, default 1.0)
             clahe: CLAHE clip limit (0 - 5, default 0 = disabled)
-            
+
         Returns:
             Dictionary with output path and applied adjustments
+
+        Raises:
+            ValueError: If any parameter is out of valid range
         """
+        # Validate input ranges
+        if not MIN_GAMMA <= gamma <= MAX_GAMMA:
+            raise ValueError(f"Gamma must be between {MIN_GAMMA} and {MAX_GAMMA}, got {gamma}")
+        if not MIN_CONTRAST <= contrast <= MAX_CONTRAST:
+            raise ValueError(f"Contrast must be between {MIN_CONTRAST} and {MAX_CONTRAST}, got {contrast}")
+        if not MIN_EXPOSURE <= exposure <= MAX_EXPOSURE:
+            raise ValueError(f"Exposure must be between {MIN_EXPOSURE} and {MAX_EXPOSURE}, got {exposure}")
+        if not MIN_CLAHE <= clahe <= MAX_CLAHE:
+            raise ValueError(f"CLAHE must be between {MIN_CLAHE} and {MAX_CLAHE}, got {clahe}")
+
         result = {
             'input_path': image_path,
             'adjustments': {
@@ -297,53 +347,53 @@ class ImageProcessor:
             },
             'output_path': None
         }
-        
+
         try:
             # Read image
             img = cv2.imread(image_path)
-            
+
             if img is None:
                 raise ValueError(f"Failed to load image: {image_path}")
-            
+
             # Apply adjustments in order
-            
+
             # 1. Exposure adjustment (brightness)
             if exposure != 1.0:
                 img = np.clip(img * exposure, 0, 255).astype(np.uint8)
-            
+
             # 2. Gamma correction
             if gamma != 1.0:
                 # Build gamma lookup table
                 inv_gamma = 1.0 / gamma
-                table = np.array([((i / 255.0) ** inv_gamma) * 255 
+                table = np.array([((i / 255.0) ** inv_gamma) * 255
                                  for i in range(256)]).astype(np.uint8)
                 img = cv2.LUT(img, table)
-            
+
             # 3. Contrast adjustment
             if contrast != 1.0:
                 # Apply contrast using alpha (gain) and beta (bias)
                 alpha = contrast
                 beta = 0  # No bias
                 img = np.clip(img * alpha + beta, 0, 255).astype(np.uint8)
-            
+
             # 4. CLAHE (Contrast Limited Adaptive Histogram Equalization)
             if clahe > 0:
                 # Convert to LAB color space
                 lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
                 l, a, b = cv2.split(lab)
-                
+
                 # Apply CLAHE to L channel
                 clahe_obj = cv2.createCLAHE(clipLimit=clahe * 2, tileGridSize=(8, 8))
                 l = clahe_obj.apply(l)
-                
+
                 # Merge and convert back
                 lab = cv2.merge([l, a, b])
                 img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-            
+
             # Save output
             output_filename = f"adjusted_{Path(image_path).stem}_{int(gamma*100)}_{int(contrast*100)}.png"
             output_path = self.temp_dir / output_filename
-            
+
             cv2.imwrite(str(output_path), img)
             result['output_path'] = str(output_path)
             
