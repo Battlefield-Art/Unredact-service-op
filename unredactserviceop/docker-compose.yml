@@ -1,0 +1,116 @@
+# UnredactServiceOp - Docker Compose Configuration
+# Production-ready setup with web, worker, redis, and beat services
+
+services:
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: unredact_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # Celery Worker - Handles heavy processing tasks
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: unredact_worker
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - LOG_LEVEL=INFO
+      - MAX_WORKERS=4
+      - TASK_SOFT_TIME_LIMIT=120
+      - TASK_HARD_TIME_LIMIT=180
+      - WORKER_MAX_MEMORY_PER_TASK=1572864000  # 1.5GB in bytes
+    volumes:
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '4.0'
+      replicas: 2
+
+  # Celery Beat - Scheduled cleanup tasks
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: unredact_beat
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - LOG_LEVEL=INFO
+    command: celery -A celery_app beat --loglevel=info --schedule=/app/celerybeat-schedule.db
+    volumes:
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+    restart: unless-stopped
+
+  # Streamlit Web Application
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: unredact_web
+    ports:
+      - "8501:8501"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - LOG_LEVEL=INFO
+      - MAX_CONTENT_SIZE=52428800  # 50MB
+      - RATE_LIMIT_FILES=20
+      - RATE_LIMIT_WINDOW=300  # 5 minutes
+    volumes:
+      - ./temp:/app/temp
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+
+volumes:
+  redis_data:
+
+networks:
+  default:
+    name: unredact_network

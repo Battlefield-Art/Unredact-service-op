@@ -1,0 +1,77 @@
+# UnredactServiceOp - Multi-stage Dockerfile for Celery Worker
+# Optimized for heavy processing with resource limits and monitoring
+
+FROM python:3.11-slim-bookworm AS builder
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libmagic1 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python dependencies
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Production stage
+FROM python:3.11-slim-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libmagic1 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    curl \
+    tini \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN groupadd -r unredact && useradd -r -g unredact unredact
+
+# Copy virtual environment from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Set working directory
+WORKDIR /app
+
+# Copy application files
+COPY celery_app.py /app/
+COPY tasks.py /app/
+COPY utils/ /app/utils/
+
+# Create required directories
+RUN mkdir -p /app/temp /app/logs && chown -R unredact:unredact /app
+
+# Switch to non-root user
+USER unredact
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    C_FORCE_ROOT=true
+
+# Use tini for proper signal handling (PID 1)
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Run Celery worker with prefetching disabled for fair scheduling
+CMD ["celery", "-A", "celery_app", "worker", \
+     "--loglevel=info", \
+     "--concurrency=4", \
+     "--prefetch-multiplier=1", \
+     "--max-tasks-per-child=50", \
+     "--timeout=120", \
+     "--soft-time-limit=120"]

@@ -1,0 +1,384 @@
+# UnredactServiceOp - Kubernetes Manifests
+# Production-ready deployment with HPA, resource limits, and health checks
+
+---
+# ConfigMap for environment configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: unredact-config
+  namespace: unredact
+  labels:
+    app: unredact
+    component: config
+data:
+  LOG_LEVEL: "INFO"
+  MAX_CONTENT_SIZE: "52428800"
+  RATE_LIMIT_FILES: "20"
+  RATE_LIMIT_WINDOW: "300"
+  TASK_SOFT_TIME_LIMIT: "120"
+  TASK_HARD_TIME_LIMIT: "180"
+  WORKER_MAX_MEMORY_PER_TASK: "1572864000"
+
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unredact-redis
+  namespace: unredact
+  labels:
+    app: unredact
+    component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unredact
+      component: redis
+  template:
+    metadata:
+      labels:
+        app: unredact
+        component: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          command:
+            - redis-server
+            - "--appendonly"
+            - "yes"
+            - "--maxmemory"
+            - "256mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+          resources:
+            limits:
+              memory: 512M
+              cpu: 500m
+            requests:
+              memory: 256M
+              cpu: 250m
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: unredact-redis
+  namespace: unredact
+spec:
+  selector:
+    app: unredact
+    component: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+  clusterIP: None
+
+---
+# Streamlit Web Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unredact-web
+  namespace: unredact
+  labels:
+    app: unredact
+    component: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: unredact
+      component: web
+  template:
+    metadata:
+      labels:
+        app: unredact
+        component: web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: web
+          image: unredact-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+              name: http
+          envFrom:
+            - configMapRef:
+                name: unredact-config
+          env:
+            - name: REDIS_URL
+              value: "redis://unredact-redis:6379/0"
+            - name: CELERY_BROKER_URL
+              value: "redis://unredact-redis:6379/0"
+            - name: CELERY_RESULT_BACKEND
+              value: "redis://unredact-redis:6379/0"
+          resources:
+            limits:
+              memory: 1G
+              cpu: "2.0"
+            requests:
+              memory: 512M
+              cpu: 500m
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8501
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8501
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: temp-storage
+              mountPath: /app/temp
+            - name: logs
+              mountPath: /app/logs
+      volumes:
+        - name: temp-storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: logs
+          emptyDir:
+            sizeLimit: 1Gi
+
+---
+# Web Service (LoadBalancer)
+apiVersion: v1
+kind: Service
+metadata:
+  name: unredact-web
+  namespace: unredact
+spec:
+  selector:
+    app: unredact
+    component: web
+  ports:
+    - port: 80
+      targetPort: 8501
+      name: http
+  type: LoadBalancer
+
+---
+# Celery Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unredact-worker
+  namespace: unredact
+  labels:
+    app: unredact
+    component: worker
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: unredact
+      component: worker
+  template:
+    metadata:
+      labels:
+        app: unredact
+        component: worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: worker
+          image: unredact-service:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: unredact-config
+          env:
+            - name: REDIS_URL
+              value: "redis://unredact-redis:6379/0"
+            - name: CELERY_BROKER_URL
+              value: "redis://unredact-redis:6379/0"
+            - name: CELERY_RESULT_BACKEND
+              value: "redis://unredact-redis:6379/0"
+            - name: MAX_WORKERS
+              value: "4"
+          resources:
+            limits:
+              memory: 2G
+              cpu: "4.0"
+            requests:
+              memory: 1G
+              cpu: "2.0"
+          volumeMounts:
+            - name: temp-storage
+              mountPath: /app/temp
+            - name: logs
+              mountPath: /app/logs
+      volumes:
+        - name: temp-storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: logs
+          emptyDir:
+            sizeLimit: 1Gi
+
+---
+# Horizontal Pod Autoscaler for Workers
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: unredact-worker-hpa
+  namespace: unredact
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: unredact-worker
+  minReplicas: 4
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# Celery Beat Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unredact-beat
+  namespace: unredact
+  labels:
+    app: unredact
+    component: beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unredact
+      component: beat
+  template:
+    metadata:
+      labels:
+        app: unredact
+        component: beat
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: beat
+          image: unredact-service:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - celery
+            - "-A"
+            - "celery_app"
+            - "beat"
+            - "--loglevel=info"
+            - "--schedule=/app/celerybeat-schedule.db"
+          envFrom:
+            - configMapRef:
+                name: unredact-config
+          env:
+            - name: REDIS_URL
+              value: "redis://unredact-redis:6379/0"
+            - name: CELERY_BROKER_URL
+              value: "redis://unredact-redis:6379/0"
+            - name: CELERY_RESULT_BACKEND
+              value: "redis://unredact-redis:6379/0"
+          resources:
+            limits:
+              memory: 512M
+              cpu: 500m
+            requests:
+              memory: 256M
+              cpu: 250m
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: unredact-ingress
+  namespace: unredact
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  rules:
+    - host: unredact.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: unredact-web
+                port:
+                  number: 80
+
+---
+# Pod Disruption Budget for Worker
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: unredact-worker-pdb
+  namespace: unredact
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: unredact
+      component: worker
+
+---
+# ResourceQuota
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: unredact-quota
+  namespace: unredact
+spec:
+  hard:
+    requests.cpu: "20"
+    requests.memory: 40Gi
+    limits.cpu: "40"
+    limits.memory: 80Gi
+    pods: "50"
+    services: "10"
+    secrets: "20"
+    configmaps: "20"
