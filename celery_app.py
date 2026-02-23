@@ -8,6 +8,21 @@ from celery import Celery
 from celery.schedules import crontab
 from kombu import Exchange, Queue
 
+# Import constants
+from constants import (
+    REDIS_MAX_CONNECTIONS,
+    REDIS_SOCKET_TIMEOUT,
+    REDIS_SOCKET_CONNECT_TIMEOUT,
+    RESULT_EXPIRES,
+    WORKER_PREFETCH_MULTIPLIER,
+    WORKER_MAX_TASKS_PER_CHILD,
+    WORKER_CONCURRENCY,
+    CELERY_RETRY_BACKOFF_MAX,
+    CELERY_MAX_RETRIES,
+    TASK_SOFT_TIME_LIMIT,
+    TASK_HARD_TIME_LIMIT,
+)
+
 # ==============================================================================
 # CONFIGURATION - All heavy tasks MUST be async Celery tasks
 # ==============================================================================
@@ -25,31 +40,31 @@ celery_app = Celery('unredactserviceop')
 # ==============================================================================
 
 celery_app.conf.update(
-    # Broker settings - Redis with connection pooling
+    # Broker settings - Redis with connection pooling (increased for 100k users)
     broker_url=CELERY_BROKER_URL,
     broker_connection_retry_on_startup=True,
     broker_connection_retry=True,
     broker_connection_max_retries=10,
-    broker_pool_limit=50,  # Connection pool for high concurrency
-    
+    broker_pool_limit=int(os.getenv('REDIS_POOL_LIMIT', str(REDIS_MAX_CONNECTIONS))),  # Increased from 50
+
     # Result backend - Redis with serialization
     result_backend=CELERY_RESULT_BACKEND,
-    result_expires=3600,  # Results expire after 1 hour
+    result_expires=int(os.getenv('RESULT_EXPIRES', str(RESULT_EXPIRES))),
     result_serializer='json',
     result_compression='gzip',
-    
+
     # Task serialization
     task_serializer='json',
     accept_content=['json'],
     task_compression='gzip',
-    
+
     # Time limits - Hard limits for resource protection
-    task_soft_time_limit=int(os.getenv('TASK_SOFT_TIME_LIMIT', '120')),
-    task_time_limit=int(os.getenv('TASK_HARD_TIME_LIMIT', '180')),
-    
-    # Worker configuration - Fair scheduling for 50+ concurrent jobs
-    worker_prefetch_multiplier=1,  # Disable prefetch for fair scheduling
-    worker_max_tasks_per_child=50,  # Restart worker after 50 tasks to prevent memory leaks
+    task_soft_time_limit=int(os.getenv('TASK_SOFT_TIME_LIMIT', str(TASK_SOFT_TIME_LIMIT))),
+    task_time_limit=int(os.getenv('TASK_HARD_TIME_LIMIT', str(TASK_HARD_TIME_LIMIT))),
+
+    # Worker configuration - Fair scheduling for 100k users
+    worker_prefetch_multiplier=WORKER_PREFETCH_MULTIPLIER,
+    worker_max_tasks_per_child=int(os.getenv('WORKER_MAX_TASKS_PER_CHILD', str(WORKER_MAX_TASKS_PER_CHILD))),
     worker_disable_rate_limits=True,
     
     # Task routing - Queue configuration
@@ -98,15 +113,15 @@ celery_app.conf.update(
     
     # Performance tuning
     broker_transport_options={
-        'visibility_timeout': 3600,
+        'visibility_timeout': int(os.getenv('REDIS_VISIBILITY_TIMEOUT', str(RESULT_EXPIRES))),
         'fanout_prefix': True,
         'fanout_patterns': True,
     },
-    
-    # Redis result backend settings
-    redis_max_connections=50,
-    redis_socket_timeout=5,
-    redis_socket_connect_timeout=5,
+
+    # Redis result backend settings - Increased for 100k users
+    redis_max_connections=int(os.getenv('REDIS_MAX_CONNECTIONS', str(REDIS_MAX_CONNECTIONS))),
+    redis_socket_timeout=int(os.getenv('REDIS_SOCKET_TIMEOUT', str(REDIS_SOCKET_TIMEOUT))),
+    redis_socket_connect_timeout=int(os.getenv('REDIS_SOCKET_CONNECT_TIMEOUT', str(REDIS_SOCKET_CONNECT_TIMEOUT))),
 )
 
 # ==============================================================================

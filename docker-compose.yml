@@ -37,12 +37,21 @@ services:
       - TASK_SOFT_TIME_LIMIT=120
       - TASK_HARD_TIME_LIMIT=180
       - WORKER_MAX_MEMORY_PER_TASK=1572864000  # 1.5GB in bytes
+      - CELERY_MAX_RETRIES=3
+      - CELERY_RETRY_BACKOFF_MAX=600
+      - REDIS_MAX_CONNECTIONS=50
     volumes:
       - ./temp:/app/temp
       - ./logs:/app/logs
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     restart: unless-stopped
     deploy:
       resources:
@@ -71,6 +80,12 @@ services:
         condition: service_healthy
       worker:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   # Streamlit Web Application
@@ -135,6 +150,12 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
     command: gunicorn -w 4 -b 0.0.0.0:5000 stripe_webhook:app
 
